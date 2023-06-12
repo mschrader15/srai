@@ -8,13 +8,13 @@ References:
     [1] https://openreview.net/forum?id=7bvWopYY1H
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, NamedTuple, Set, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, NamedTuple, Set, Tuple, TypeVar
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from srai.neighbourhoods import Neighbourhood
+from srai.neighbourhoods import Neighbourhood, H3Neighbourhood
 from srai.utils._optional import import_optional_dependencies
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -41,7 +41,6 @@ class HexagonalDatasetItem(NamedTuple):
     hex_matrix: "torch.Tensor"
 
 
-
 class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
     """
     Dataset for the hexagonal encoder model.
@@ -54,6 +53,7 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
     def __init__(
         self,
         data: pd.DataFrame,
+        neighbourhood: H3Neighbourhood[T],
         neighbor_k_ring=6,
     ):
         """
@@ -61,58 +61,84 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
 
         Args:
             data (pd.DataFrame): Data to use for training. Raw counts of features in regions.
-            neighbor_k_ring (int, optional): _description_. Defaults to 6.
+            neighbourhood (Neighbourhood[T]): H3Neighbourhood to use for training.
+                It has to be initialized with the same data as the data argument.
+            neighbor_k_ring (int, optional): The hexagonal rings of neighbors to include
+                in the tensor. Defaults to 6.
         """
-
         import_optional_dependencies(dependency_group="torch", modules=["torch"])
-        
-        
-        self._valid_h3 = []
+        import torch
+
+        self._assert_k_ring_correct(neighbor_k_ring)
+        self._assert_h3_neighbourhood(neighbourhood)
+
+        # get the set of all indices in the dataset
         all_indices = set(data.index)
-
+        # store the desired k
+        self._k: int = neighbor_k_ring
         # number of columns in the dataset
-        self._N = data.shape[1]
-        self._k = neighbor_k_ring
+        self._N: int = data.shape[1]
+        # store the list of valid h3 indices (have all the neighbors in the dataset)
+        self._valid_h3: List[Tuple[str, int, List[Tuple[int, Tuple[int, int]]]]] = []
 
-        for i, (h3_index, hex_data) in tqdm(
-            enumerate(data.iterrows()), total=len(data)
-        ):
-            hex_neighbors_h3 = h3.grid_disk(h3_index, neighbor_k_ring)
+        self._data_torch = torch.Tensor(data.to_numpy(dtype=np.float32))
+
+        # iterate over the data and build the valid h3 indices
+        self._build_valid_h3s(data, neighbourhood, neighbor_k_ring, torch, all_indices)
+
+    def _build_valid_h3s(self, data, neighbourhood, neighbor_k_ring, torch, all_indices):
+        for h3_index in tqdm(data.index, total=len(data)):
+            neighbors = neighbourhood.get_neighbours_up_to_distance(h3_index, neighbor_k_ring)
+
             # remove the h3_index from the neighbors
-            hex_neighbors_h3.remove(h3_index)
-            available_neighbors_h3 = list(hex_neighbors_h3.intersection(all_indices))
-            if len(available_neighbors_h3) < len(hex_neighbors_h3):
-                # skip adding this h3 as a valid input
-                continue
-            anchor = np.array(h3.cell_to_local_ij(h3_index, h3_index))
-            self._valid_h3.append(
-                (
-                    h3_index,
-                    data.index.get_loc(h3_index),
-                    [
-                        # get the index of the h3 in the dataset
-                        (
-                            data.index.get_loc(_h),
-                            tuple(
-                                (
-                                    np.array(h3.cell_to_local_ij(h3_index, _h)) - anchor
-                                ).tolist()
-                            ),
-                        )
-                        for _h in hex_neighbors_h3
-                    ],
+            neighbors.remove(h3_index)
+            # check if all the neighbors are in the dataset
+            if len(neighbors.intersection(all_indices)) == len(neighbors):
+                # all the neighbors are in the dataset, continue building the dataset
+                anchor = neighbourhood.get_ij_index(h3_index, h3_index)
+                # add the h3_index to the valid h3 indices, with the ring of neighbors
+                self._valid_h3.append(
+                    (
+                        h3_index,
+                        data.index.get_loc(h3_index),
+                        [
+                            # get the index of the h3 in the dataset
+                            (
+                                data.index.get_loc(_h),
+                                self._subtract_ij(neighbourhood.get_ij_index(h3_index, _h), anchor),
+                            )
+                            for _h in neighbors
+                        ],
+                    )
                 )
-            )
 
-        self._data = data.to_numpy(dtype=np.float32)
-        self._data_torch = torch.Tensor(self._data)
+    @staticmethod
+    def _subtract_ij(ij_1: Tuple[int, int], ij_2: Tuple[int, int]) -> Tuple[int, int]:
+        return (
+            ij_1[0] - ij_2[0],
+            ij_1[1] - ij_2[1],
+        )
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """
+        Returns the number of valid h3 indices in the dataset.
+
+        Returns:
+            int: Number of valid h3 indices in the dataset.
+        """
         return len(self._valid_h3)
 
-    def __getitem__(self, index):
-        # construct the 3d tensor
-        h3_index, target_idx, neighbors_idxs = self._valid_h3[index]
+    def __getitem__(self, index: Any) -> HexagonalDatasetItem:
+        """
+        Return a single item from the dataset.
+
+        Args:
+            index (Any): The index of dataset item to return
+
+        Returns:
+            HexagonalDatasetItem: The dataset item
+        """
+        _, target_idx, neighbors_idxs = self._valid_h3[index]
         return self._build_tensor(target_idx, neighbors_idxs)
 
     def _build_tensor(self, target_idx, neighbors_idxs):
@@ -141,25 +167,18 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
         for neighbor_idx, (i, j) in neighbors_idxs:
             tensor[:, self._k + i, self._k + j] = self._data_torch[neighbor_idx]
 
-
         # return the tensor and the target (which is same as the tensor)
         # should we return the target as a copy of the tensor?
         return tensor
 
+    def _assert_k_ring_correct(self, k_ring: int) -> None:
+        if k_ring < 2:
+            raise ValueError(f"k_ring must be at least 2, but was {k_ring}")
 
-    def full_dataset(self):
-        h3s = []
-        tensors = []
-        for h3_, target_idx, neighbors_idxs in tqdm(self._valid_h3, total=len(self._valid_h3)):
-            h3s.append(h3_)
-            tensors.append(self._build_tensor(target_idx, neighbors_idxs))
-        
-        return h3s, torch.stack(tensors)
-
-    @property
-    def shape(
-        self,
-    ) -> int:
-        return self._N, (2 * self._k + 1), (2 * self._k + 1)
-
-
+    def _assert_h3_neighbourhood(self, neighbourhood: Neighbourhood[T]) -> None:
+        # force that the neighbourhood is an H3Neighbourhood,
+        # because we need the get_ij_index method
+        if not isinstance(neighbourhood, H3Neighbourhood):
+            raise ValueError(
+                f"neighbourhood has to be an H3Neighbourhood, but was {type(neighbourhood)}"
+            )
