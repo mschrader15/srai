@@ -54,7 +54,7 @@ class H3Regionalizer(Regionalizer):
         self.resolution = resolution
         self.buffer = buffer
 
-    def transform(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    def transform(self, gdf: gpd.GeoDataFrame, k_ring_buffer_radius: int = 0) -> gpd.GeoDataFrame:
         """
         Regionalize a given GeoDataFrame.
 
@@ -63,6 +63,8 @@ class H3Regionalizer(Regionalizer):
 
         Args:
             gdf (gpd.GeoDataFrame): (Multi)Polygons to be regionalized.
+            k_ring_buffer_radius (int, optional): the k-ring around the hexagon to be buffered. 
+                Defaults to 0, meaning no buffering.
 
         Returns:
             gpd.GeoDataFrame: H3 cells.
@@ -79,6 +81,7 @@ class H3Regionalizer(Regionalizer):
             seq(gdf_buffered[GEOMETRY_COLUMN])
             .map(self._polygon_shapely_to_h3)
             .flat_map(lambda polygon: h3.polygon_to_cells(polygon, self.resolution))
+            .flat_map(lambda h3_index: (h3.grid_disk(h3_index, k_ring_buffer_radius)))
             .distinct()
             .to_list()
         )
@@ -86,7 +89,7 @@ class H3Regionalizer(Regionalizer):
         gdf_h3 = self._gdf_from_h3_indexes(h3_indexes)
 
         # there may be too many cells because of too big buffer
-        if self.buffer:
+        if self.buffer and k_ring_buffer_radius < 1:
             gdf_h3_clipped = gdf_h3.sjoin(gdf_exploded[[GEOMETRY_COLUMN]]).drop(
                 columns="index_right"
             )
@@ -194,3 +197,6 @@ class H3Regionalizer(Regionalizer):
             geometry=buffered_geometries,
             index=gdf.index,
         )
+
+
+

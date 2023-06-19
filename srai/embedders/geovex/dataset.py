@@ -21,10 +21,11 @@ if TYPE_CHECKING:  # pragma: no cover
     import torch
 
 try:  # pragma: no cover
+    import torch
     from torch.utils.data import Dataset
 
 except ImportError:
-    from srai.utils._pytorch_stubs import Dataset
+    from srai.utils._pytorch_stubs import Dataset, torch
 
 
 T = TypeVar("T")
@@ -53,7 +54,7 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
     def __init__(
         self,
         data: pd.DataFrame,
-        neighbourhood: H3Neighbourhood[T],
+        neighbourhood: Neighbourhood[T],
         neighbor_k_ring=6,
     ):
         """
@@ -61,7 +62,7 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
 
         Args:
             data (pd.DataFrame): Data to use for training. Raw counts of features in regions.
-            neighbourhood (Neighbourhood[T]): H3Neighbourhood to use for training.
+            neighbourhood (H3Neighbourhood[T]): H3Neighbourhood to use for training.
                 It has to be initialized with the same data as the data argument.
             neighbor_k_ring (int, optional): The hexagonal rings of neighbors to include
                 in the tensor. Defaults to 6.
@@ -71,27 +72,22 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
 
         self._assert_k_ring_correct(neighbor_k_ring)
         self._assert_h3_neighbourhood(neighbourhood)
-
-        # get the set of all indices in the dataset
-        all_indices = set(data.index)
         # store the desired k
         self._k: int = neighbor_k_ring
         # number of columns in the dataset
         self._N: int = data.shape[1]
         # store the list of valid h3 indices (have all the neighbors in the dataset)
         self._valid_h3: List[Tuple[str, int, List[Tuple[int, Tuple[int, int]]]]] = []
-
+        # store the data as a torch tensor
         self._data_torch = torch.Tensor(data.to_numpy(dtype=np.float32))
-
         # iterate over the data and build the valid h3 indices
-        self._build_valid_h3s(data, neighbourhood, neighbor_k_ring, torch, all_indices)
+        self._invalid_h3s = self._build_valid_h3s(data, neighbourhood, neighbor_k_ring, torch, set(data.index))
 
     def _build_valid_h3s(self, data, neighbourhood, neighbor_k_ring, torch, all_indices):
+        invalid_h3s = set()
+
         for h3_index in tqdm(data.index, total=len(data)):
             neighbors = neighbourhood.get_neighbours_up_to_distance(h3_index, neighbor_k_ring)
-
-            # remove the h3_index from the neighbors
-            neighbors.remove(h3_index)
             # check if all the neighbors are in the dataset
             if len(neighbors.intersection(all_indices)) == len(neighbors):
                 # all the neighbors are in the dataset, continue building the dataset
@@ -111,6 +107,11 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
                         ],
                     )
                 )
+            else:
+                # some of the neighbors are not in the dataset, add the h3_index to the invalid h3s
+                invalid_h3s.add(h3_index)
+        return invalid_h3s
+
 
     @staticmethod
     def _subtract_ij(ij_1: Tuple[int, int], ij_2: Tuple[int, int]) -> Tuple[int, int]:
@@ -142,6 +143,7 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
         return self._build_tensor(target_idx, neighbors_idxs)
 
     def _build_tensor(self, target_idx, neighbors_idxs):
+        import torch
         # build the 3d tensor
         # it is a tensor with diagonals of length neighbor_k_ring
         # the diagonals are the neighbors of the target h3
@@ -182,3 +184,21 @@ class HexagonalDataset(Dataset[HexagonalDatasetItem], Generic[T]):
             raise ValueError(
                 f"neighbourhood has to be an H3Neighbourhood, but was {type(neighbourhood)}"
             )
+
+    def get_ordered_index(self) -> List[str]:
+        """
+        Returns the list of valid h3 indices in the dataset.
+
+        Returns:
+            List[str]: List of valid h3 indices in the dataset.
+        """
+        return [h3_index for h3_index, _, _ in self._valid_h3]
+
+    def get_invalid_h3s(self) -> List[str]:
+        """
+        Returns the list of invalid h3 indices in the dataset.
+
+        Returns:
+            List[str]: List of invalid h3 indices in the dataset.
+        """
+        return list(self._invalid_h3s)

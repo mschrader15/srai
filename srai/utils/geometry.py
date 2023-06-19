@@ -71,3 +71,7 @@ def buffer_geometry(geometry: BaseGeometry, meters: float) -> BaseGeometry:
     bufferred_projected_geometry = projected_geometry.buffer(meters)
 
     return shapely_transform(aeqd_to_wgs84, bufferred_projected_geometry)
+
+# def buffer_by_h3(gdf: gpd.GeoDataFrame, resolution: int, ring: int) -> gpd.GeoDataFrame:
+
+#     z

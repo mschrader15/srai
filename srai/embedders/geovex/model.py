@@ -1,3 +1,12 @@
+"""
+GeoVexModel.
+
+This pytorch lightning module implements the GeoVeX hexagonal autoencoder model.
+
+References:
+    [1] https://openreview.net/forum?id=7bvWopYY1H
+"""
+import math
 from typing import TYPE_CHECKING, List, Tuple
 
 from srai.utils._optional import import_optional_dependencies
@@ -6,15 +15,26 @@ if TYPE_CHECKING:  # pragma: no cover
     import torch
     from torch import nn
 
-
 try:  # pragma: no cover
+    import torch  # noqa: F811
     from pytorch_lightning import LightningModule
+    from torch import nn  # noqa: F811
 
 except ImportError:
-    from srai.utils._pytorch_stubs import LightningModule
+    from srai.utils._pytorch_stubs import LightningModule, nn, torch
 
 
-# This is based on https://openreview.net/forum?id=7bvWopYY1H
+def get_shape(r: int) -> int:
+    """
+    Get the shape of the embedding.
+
+    Args:
+        r (int): The radius of the hexagonal region.
+
+    Returns:
+        int: The shape of the embedding.
+    """
+    return 2 * r + 2
 
 
 def build_mask_funcs(R: int) -> Tuple[callable, callable]:
@@ -76,14 +96,16 @@ class GeoVeXLoss(nn.Module):  # type: ignore
         self.R = R
         self._w_dist, self._w_num = build_mask_funcs(self.R)
 
-        M = 2 * self.R + 1
+        # strip out the padding from y,
+        # so that the loss function is only calculated on the valid regions
+        self.M = get_shape(self.R) - 1
 
         self._w_dist_matrix = torch.tensor(
-            [[self._w_dist(i, j) for j in range(M)] for i in range(M)],
+            [[self._w_dist(i, j) for j in range(self.M)] for i in range(self.M)],
             dtype=torch.float32,
         )
         self._w_num_matrix = torch.tensor(
-            [[self._w_num(i, j) for j in range(M)] for i in range(M)],
+            [[self._w_num(i, j) for j in range(self.M)] for i in range(self.M)],
             dtype=torch.float32,
         )
 
@@ -99,8 +121,10 @@ class GeoVeXLoss(nn.Module):  # type: ignore
         Returns:
             float: The loss value.
         """
-        # trim the padding from y
-        y = y[:, :, : 2 * self.R + 1, : 2 * self.R + 1]
+        # trim the padding from y, pi, and lambda_
+        y = y[:, :, : self.M, : self.M]
+        pi = pi[:, :, : self.M, : self.M]
+        lambda_ = lambda_[:, :, : self.M, : self.M]
 
         I0 = (y == 0).float()
         I_greater_0 = (y > 0).float()
@@ -145,6 +169,9 @@ class HexagonalConv2d(nn.Module):  # type: ignore
             bias (bool, optional): Whether to use bias. Defaults to True.
             groups (int, optional): The number of groups. Defaults to 1.
         """
+        import torch
+        from torch import nn
+
         super().__init__()
 
         if kernel_size != 3:
@@ -155,8 +182,8 @@ class HexagonalConv2d(nn.Module):  # type: ignore
         )
         self.register_buffer("hexagonal_mask", self._create_hexagonal_mask())
 
-    @classmethod
-    def _create_hexagonal_mask(cls) -> "torch.Tensor":
+    @staticmethod
+    def _create_hexagonal_mask() -> "torch.Tensor":
         """Create the hexagonal mask."""
         return torch.tensor([[0, 1, 1], [1, 1, 1], [1, 1, 0]], dtype=torch.float32)
 
@@ -201,7 +228,9 @@ class HexagonalConvTranspose2d(HexagonalConv2d):  # type: ignore
             output_padding (int, optional): The output padding of the convolution. Defaults to 0.
             bias (bool, optional): Whether to use bias. Defaults to True.
         """
-        super(nn.Module, self).__init__()
+        from torch import nn
+
+        super(HexagonalConv2d, self).__init__()
 
         self.conv = nn.ConvTranspose2d(
             in_channels,
@@ -244,7 +273,7 @@ class Reshape(nn.Module):  # type: ignore
 class GeoVeXZIP(nn.Module):
     """GeoVeX Zero-Inflated Poisson Layer."""
 
-    def __init__(self, in_dim: int, r: int, out_dim: int):
+    def __init__(self, in_dim: int, m: int, out_dim: int):
         """
         Initialize the GeoVeXZIP layer.
 
@@ -253,9 +282,12 @@ class GeoVeXZIP(nn.Module):
             r (int): The radius of the hexagonal region.
             out_dim (int): The output dimension.
         """
+        import torch
+        from torch import nn
+
         super().__init__()
         self.in_dim = in_dim
-        self.R = r
+        self.M = m
         self.out_dim = out_dim
         self.pi = nn.Linear(in_dim, out_dim)
         self.lambda_ = nn.Linear(in_dim, out_dim)
@@ -270,20 +302,20 @@ class GeoVeXZIP(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The predicted pi and lambda tensors.
         """
-        _x = x.view(-1, self.R, self.R, self.in_dim)
+        _x = x.view(-1, self.M, self.M, self.in_dim)
         pi = torch.sigmoid(self.pi(_x))
         # clamp pi to avoid nan's
         pi = pi.view(
             -1,
             self.out_dim,
-            self.R,
-            self.R,
+            self.M,
+            self.M,
         )
         lambda_ = torch.exp(self.lambda_(_x)).view(
             -1,
             self.out_dim,
-            self.R,
-            self.R,
+            self.M,
+            self.M,
         )
         pi = torch.clamp(pi, 1e-5, 1 - 1e-5)
         return pi, lambda_
@@ -304,6 +336,7 @@ class GeoVexModel(LightningModule):
         self,
         k_dim: int,
         R: int,
+        conv_layers: int = 2,
         emb_size: int = 32,
         learning_rate: float = 1e-5,
     ):
@@ -313,72 +346,98 @@ class GeoVexModel(LightningModule):
         Args:
             k_dim (int): the number of input channels
             R (int): the radius of the hexagonal region
+            conv_layers (int, optional): The number of convolutional layers. Defaults to 2.
             emb_size (int, optional): The dimension of the inner embedding. Defaults to 32.
             learning_rate (float, optional): The learning rate. Defaults to 1e-5.
         """
         import_optional_dependencies(
             dependency_group="torch", modules=["torch", "pytorch_lightning"]
         )
-
+        import torch
         from torch import nn
 
         super().__init__()
 
         self.k_dim = k_dim
+
+        assert self.k_dim > 256, "k_dim must be greater than 256"
+
         self.R = R
         self.lr = learning_rate
         self.emb_size = emb_size
 
-        num_conv = 1
-        lin_size = 4  # self.R // (2 ** num_conv)
+        # input size is 2R + 2
+        self.M = get_shape(self.R)
 
+        # calculate the padding to preserve the input size
+        #  equation for output size with stride is
+        #  out_size = (in_size - kernel_size + padding + stride) / stride
+        stride = 2
+        kernel_size = 3
+        padding = math.ceil(((stride - 1) * self.M - stride + kernel_size) / 2)
+
+        # find the size of the linear layer
+        # equation is the output size of the conv layers
+        in_size = self.M
+        ll_padding = 0 if self.R < 5 else 1
+        for _ in range(conv_layers - 1):
+            out_size = math.floor(
+                (in_size - kernel_size + ll_padding + stride) / stride,
+            )
+            in_size = out_size
+
+        conv_sizes = [256 * 2**i for i in range(conv_layers)]
         self.encoder = nn.Sequential(
             nn.BatchNorm2d(self.k_dim),
             nn.ReLU(),
-            # nn.Conv1d(self.k_dim, 256, kernel_size=3, stride=2),
             # have to add padding to preserve the input size
-            HexagonalConv2d(self.k_dim, 256, kernel_size=3, stride=2, padding=6),
-            # # HexagonalConv2d(self.k_dim, 256, kernel_size=3, stride=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            HexagonalConv2d(256, 512, kernel_size=3, stride=2),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            # HexagonalConv2d(512, 1024, kernel_size=3, stride=2),
-            # nn.BatchNorm2d(1024),
-            # nn.ReLU(),
-            nn.Flatten(),
-            # # # TODO: make this a function of R
-            nn.Linear(lin_size**2 * 512, self.emb_size),
-        )
-
-        self.decoder = nn.Sequential(
-            nn.Linear(self.emb_size, lin_size**2 * 512),
-            # maintain the batch size, but reshape the rest
-            Reshape((-1, 512, lin_size, lin_size)),
-            # HexagonalConvTranspose2d(1024, 512, kernel_size=3, stride=2),
-            # # HexagonalConvTranspose2d(512, 256, kernel_size=3, stride=2),
-            # nn.BatchNorm2d(512),
-            # nn.ReLU(),
-            HexagonalConvTranspose2d(
-                512,
-                256,
-                kernel_size=3,
-                stride=2,
+            HexagonalConv2d(
+                self.k_dim, conv_sizes[0], kernel_size=3, stride=2, padding=int(padding)
             ),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            # HexagonalConvTranspose2d(256, 256, kernel_size=3, stride=2),
-            # nn.BatchNorm2d(256),
-            # nn.ReLU(),
-            # HexagonalConvTranspose2d(256, self.k_dim, kernel_size=3, stride=2),
-            # nn.BatchNorm2d(self.k_dim),
-            # nn.ReLU(),
-            # nn.ReLU(),
-            # ,
-            # nn.BatchNorm2d(self.k_dim),
-            # nn.ReLU(),
-            GeoVeXZIP(256, self.R * 2 + 1, self.k_dim),
+            *(
+                # second conv block
+                nn.Sequential(
+                    HexagonalConv2d(
+                        conv_sizes[i - 1],
+                        conv_sizes[i],
+                        kernel_size=3,
+                        stride=2,
+                        padding=ll_padding,
+                    ),
+                    nn.BatchNorm2d(conv_sizes[i]),
+                    nn.ReLU(),
+                )
+                for i in range(1, conv_layers)
+            ),
+            # flatten
+            nn.Flatten(),
+            nn.Linear(out_size**2 * conv_sizes[-1], self.emb_size),
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(self.emb_size, out_size**2 * conv_sizes[-1]),
+            # maintain the batch size, but reshape the rest
+            Reshape((-1, conv_sizes[-1], out_size, out_size)),
+            # decoder has conv transpose layers - 1,
+            # as the reshape layer is the first "transpose layer"
+            *(
+                nn.Sequential(
+                    HexagonalConvTranspose2d(
+                        conv_sizes[-1 * (i + 1)],
+                        conv_sizes[-1 * (i + 2)],
+                        kernel_size=3,
+                        stride=2,
+                        output_padding=1,
+                        padding=ll_padding,
+                    ),
+                    nn.BatchNorm2d(conv_sizes[-1 * (i + 2)]),
+                    nn.ReLU(),
+                )
+                for i in range(conv_layers - 1)
+            ),
+            GeoVeXZIP(conv_sizes[0], self.M, self.k_dim),
         )
 
         self._loss = GeoVeXLoss(self.R)

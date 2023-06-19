@@ -12,6 +12,7 @@ from .count_embedder import CountEmbedder
 from .gtfs2vec import GTFS2VecEmbedder
 from .hex2vec import Hex2VecEmbedder
 from .highway2vec import Highway2VecEmbedder
+from .geovex import GeoVexEmbedder
 
 __all__ = [
     "Embedder",
@@ -20,4 +21,5 @@ __all__ = [
     "GTFS2VecEmbedder",
     "Hex2VecEmbedder",
     "Highway2VecEmbedder",
+    "GeoVexEmbedder",
 ]
